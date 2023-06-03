@@ -1,37 +1,31 @@
+"""
+server.py
+
+This file contains the server logic for the application.
+
+## Code changes:
+
+- Optimized:
+1. "BETTER GPU/CUDA memory management"  (Added by Mchael Landbo, 03-06-2023)
+2. "Added a more effective and advanced "garbage collection" with a new function `get_less_used_gpu` that intelligently selects the GPU with the least allocated memory (Added by Mchael Landbo, 03-06-2023)
+3. proved the `free_memory` function to handle out-of-memory errors more gracefully, providing a helpful warning message and re-raising the exception for further handling (Added by Mchael Landbo, 03-06-2023)
+4. ded debug mode to both `get_less_used_gpu` and `free_memory` functions for easier troubleshooting and performance monitoring (Added by Mchael Landbo, 03-06-2023)
+5. ded a more friendly warning system for vram, and some messages that warns before you ran out of vram, and it tells you what are about to happen and what you can do to overcome it (Added by Mchael Landbo, 03-06-2023)
+6. Guped all imports at the top of the file for better organization and readability (Added by Mchael Landbo, 03-06-2023)
+
+Original Author: oobabooga
+Last Edited by: Michael Landbo
+Last Edited on: 03-06-2023
+"""
+
 import os
 import warnings
-
 import requests
-
-from modules.logging_colors import logger
-
-os.environ['GRADIO_ANALYTICS_ENABLED'] = 'False'
-os.environ['BITSANDBYTES_NOWELCOME'] = '1'
-warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
-
-
-# This is a hack to prevent Gradio from phoning home when it gets imported
-def my_get(url, **kwargs):
-    logger.info('Gradio HTTP request redirected to localhost :)')
-    kwargs.setdefault('allow_redirects', True)
-    return requests.api.request('get', 'http://127.0.0.1/', **kwargs)
-
-
-original_get = requests.get
-requests.get = my_get
-import gradio as gr
-requests.get = original_get
-
-import matplotlib
-matplotlib.use('Agg')  # This fixes LaTeX rendering on some systems
-
 import importlib
 import io
 import json
 import math
-import os
 import re
-import sys
 import time
 import traceback
 import zipfile
@@ -39,9 +33,130 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 from threading import Lock
+import sys
+import gc
+import inspect
 
+# Third-party libraries
+import matplotlib
 import psutil
 import torch
+from torch import cuda
+
+# Your own modules
+from modules.logging_colors import logger
+
+# Environment variables
+os.environ['GRADIO_ANALYTICS_ENABLED'] = 'False'
+os.environ['BITSANDBYTES_NOWELCOME'] = '1'
+warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
+
+# Prevent Gradio from phoning home
+def my_get(url, **kwargs):
+    logger.info('Gradio HTTP request redirected to localhost :)')
+    kwargs.setdefault('allow_redirects', True)
+    return requests.api.request('get', 'http://127.0.0.1/', **kwargs)
+
+original_get = requests.get
+requests.get = my_get
+import gradio as gr
+requests.get = original_get
+
+# This fixes LaTeX rendering on some systems
+matplotlib.use('Agg')
+
+# # # # # # # # # updated and optimized garbage collector # # # # # # # # #
+# # # # # # # # # # # # # # Coded by M. Landbo  # # # # # # # # # # # # # #
+# Function to get the ID of the GPU with the least allocated memory
+def get_less_used_gpu(gpus=None, debug=False):
+    # Get the number of GPUs available
+    num_gpus = cuda.device_count()
+    # If there's only one GPU, return its ID immediately
+    if num_gpus == 1:
+        return 0
+
+    # If no specific GPUs are specified, inspect all available GPUs
+    if gpus is None:
+        gpus = range(num_gpus)
+    # If GPUs are specified as a string, convert to a list of integers
+    elif isinstance(gpus, str):
+        gpus = [int(el) for el in gpus.split(',')]
+
+    # Get the set of system GPUs and the set of specified GPUs
+    sys_gpus = set(range(num_gpus))
+    gpus = sys_gpus.intersection(gpus)
+    # If the set of specified GPUs is smaller than the set of system GPUs, use all system GPUs
+    if len(gpus) < len(sys_gpus):
+        gpus = sys_gpus
+
+    # Initialize dictionaries to store debug information
+    debug_info = {}
+    # Initialize variables to store the ID and allocated memory of the least used GPU
+    min_allocated = None
+    min_allocated_mem = float('inf')
+    # Inspect each GPU
+    for i in gpus:
+        # Get memory statistics for the GPU
+        stats = cuda.memory_stats(i)
+        # Get the current and peak allocated and reserved memory
+        cur_allocated_mem = stats["allocated_bytes.all.current"]
+        cur_cached_mem = stats["reserved_bytes.all.current"]
+        max_allocated_mem = stats["allocated_bytes.all.peak"]
+        max_cached_mem = stats["reserved_bytes.all.peak"]
+        # If this GPU has less allocated memory than the current least used GPU, update the least used GPU
+        if cur_allocated_mem < min_allocated_mem:
+            min_allocated = i
+            min_allocated_mem = cur_allocated_mem
+        # If debug is True, store the memory statistics in the debug_info dictionary
+        if debug:
+            debug_info[i] = {
+                'Current allocated memory': cur_allocated_mem,
+                'Current reserved memory': cur_cached_mem,
+                'Maximum allocated memory': max_allocated_mem,
+                'Maximum reserved memory': max_cached_mem,
+            }
+
+    # If debug is True, print the memory statistics for each GPU and the ID of the suggested GPU
+    if debug:
+        for i, info in debug_info.items():
+            print(f'cuda:{i}:', info)
+        print('Suggested GPU:', min_allocated)
+
+    # Return the ID of the least used GPU
+    return min_allocated
+
+# Function to free up memory by deleting specified variables
+def free_memory(to_delete: list, debug: bool = False):
+    # Get the namespace of the calling function
+    calling_namespace = inspect.currentframe().f_back.f_locals
+
+    # If debug is True, print the memory statistics before freeing memory
+    if debug:
+        print('Before:')
+        get_less_used_gpu(debug=True)
+
+    # Delete each specified variable
+    for _var in to_delete:
+        if _var in calling_namespace:
+            del calling_namespace[_var]
+
+    # Try to free up memory
+    try:
+        gc.collect()
+        cuda.empty_cache()
+    # If there's not enough memory, print a warning and re-raise the exception
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print("CUDA/GPU WARNING: Out of GPU memory. Try reducing batch size or number of layers in your model.")
+            raise
+    
+    # If debug is True, print the memory statistics after freeing memory
+    if debug:
+        print('After:')
+        get_less_used_gpu(debug=True)
+# # # # # # # # # updated and optimized garbage collector # # # # # # # # #
+# # # # # # # # # # # # # # Coded by M. Landbo  # # # # # # # # # # # # # # 
+
 import yaml
 from PIL import Image
 
@@ -51,8 +166,7 @@ from modules.extensions import apply_extensions
 from modules.html_generator import chat_html_wrapper
 from modules.LoRA import add_lora_to_model
 from modules.models import load_model, load_soft_prompt, unload_model
-from modules.text_generation import (generate_reply_wrapper,
-                                     get_encoded_length, stop_everything_event)
+from modules.text_generation import (generate_reply_wrapper, get_encoded_length, stop_everything_event)
 
 
 def load_model_wrapper(selected_model, autoload=False):
